@@ -1,21 +1,20 @@
 use std::{
-    io::{BufReader, BufWriter},
     net::{TcpListener, TcpStream},
-    time::{Duration, Instant},
+    time::{Instant, SystemTime},
 };
 
 use crlf::{self, service};
 
 #[service]
 pub trait PingSvc {
-    fn ping(&mut self, n: usize) -> usize;
+    fn ping(&mut self) -> std::time::SystemTime;
 }
 
 pub struct PingImpl;
 
 impl PingSvc for PingImpl {
-    fn ping(&mut self, n: usize) -> usize {
-        n
+    fn ping(&mut self) -> SystemTime {
+        SystemTime::now()
     }
 }
 
@@ -30,7 +29,7 @@ enum Mode {
     Client {
         host: String,
         port: u16,
-        payload: usize,
+        count: usize,
     },
     Server {
         port: u16,
@@ -45,6 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let listener = TcpListener::bind(("0.0.0.0", port))?;
             for connection in listener.incoming() {
                 if let Ok(write_stream) = connection {
+                    write_stream.set_nodelay(true)?;
                     let read_stream = write_stream.try_clone()?;
                     std::thread::spawn(move || {
                         server::PingSvc {
@@ -57,23 +57,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        Mode::Client {
-            host,
-            port,
-            payload,
-        } => {
+        Mode::Client { host, port, count } => {
             let write_stream = TcpStream::connect((host.as_str(), port))?;
+            write_stream.set_nodelay(true)?;
             let read_stream = write_stream.try_clone()?;
             let mut client = client::PingSvc {
                 sender: write_stream,
                 receiver: read_stream,
             };
-            let start = Instant::now();
-            for _ in 0..100 {
-                let r = client.ping(payload);
+            let mut i = 0;
+            for _ in 0..count {
+                i += 1;
+                let start = Instant::now();
+                let dt = client
+                    .ping()
+                    .duration_since(SystemTime::UNIX_EPOCH)?
+                    .as_micros();
+                let end = start.elapsed().as_micros();
+                println!("{i:2} {end:5}uS at {dt:?}");
             }
-            let end = start.elapsed();
-            println!("{}ms:\t{}", end.as_micros() as f64 / 1000f64 / 100f64, 123);
         }
     }
     Ok(())

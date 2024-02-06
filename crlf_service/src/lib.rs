@@ -42,7 +42,7 @@ pub fn service(
         }
     });
 
-    let fn_impls = input.items.iter().filter_map(|i| {
+    let client_impls = input.items.iter().filter_map(|i| {
         if let TraitItem::Fn(f) = i {
             let sig = f.sig.clone();
             let name = sig.ident.clone();
@@ -58,8 +58,8 @@ pub fn service(
                 let op = super::rpc::Request::#name(#(#args,)*);
                 crlf::bincode::serialize_into(&mut self.sender, &op).expect("Oops");
                 match crlf::bincode::deserialize_from(&mut self.receiver) {
-                Ok(super::rpc::Response::#name(output)) => output,
-                _ => panic!("Malformed RPC"),
+		    Ok(super::rpc::Response::#name(output)) => output,
+		    _ => panic!("Malformed RPC"),
                 }
             }
             })
@@ -116,7 +116,7 @@ pub fn service(
         }
 
         impl<W: ::std::io::Write, R: ::std::io::Read> #service_name<W, R> {
-        #(#fn_impls)*
+        #(#client_impls)*
         }
     }
 
@@ -130,11 +130,11 @@ pub fn service(
         impl<W: ::std::io::Write, R: ::std::io::Read, S: super::#service_name> #service_name<W, R, S> {
         pub fn run(&mut self) {
             loop {
-            match crlf::bincode::deserialize_from::<_, super::rpc::Request>(&mut self.receiver).map_err(|c| *c) {
-                #(#server_fns)*
-                Err(crlf::bincode::ErrorKind::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                e => panic!("Malformed RPC {:?}", e),
-            }
+        match crlf::bincode::deserialize_from::<_, super::rpc::Request>(&mut self.receiver).map_err(|c| *c) {
+            #(#server_fns)*
+            Err(crlf::bincode::ErrorKind::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            e => panic!("Malformed RPC {:?}", e),
+        }
             }
         }
         }
