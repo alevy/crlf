@@ -1,0 +1,9 @@
+# Licensed under the the MIT License.
+# Copyright Amit Levy 2024.
+
+[workspace]
+members = [
+  "crlf"
+, "crlf_service"
+, "protocols/ping" ]
+resolver = "2"
