@@ -5,5 +5,5 @@
 members = [
   "crlf"
 , "crlf_service"
-, "protocols/ping" ]
+, "protocols/ping" , "protocols/raft"]
 resolver = "2"
