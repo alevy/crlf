@@ -70,8 +70,8 @@ pub struct RaftNode<STM: StateMachine, const N: usize = 3> {
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 struct LeaderState<const N: usize> {
-    //next_idx: [LogIdx; N],
-    //match_idx: [LogIdx; N],
+    next_idx: [LogIdx; N],
+    match_idx: [LogIdx; N],
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -79,6 +79,13 @@ enum Role<const N: usize> {
     Follower,
     Candidate,
     Leader(LeaderState<N>),
+}
+
+#[derive(PartialEq, Eq, Clone, Debug, Serialize, Deserialize)]
+#[serde(crate = "crlf::serde")]
+pub enum AppendEntriesError {
+    StaleTerm(Term),
+    InconsistentLog,
 }
 
 #[service]
@@ -91,7 +98,7 @@ pub trait RaftSvc {
         prev_log_term: Term,
         entries: Vec<(Term, KvCommand)>,
         leader_commit_idx: Option<LogIdx>,
-    ) -> (Term, bool);
+    ) -> Result<(), AppendEntriesError>;
 
     fn request_vote(
         &mut self,
@@ -123,6 +130,10 @@ impl<const N: usize> RaftNode<KvStateMachine, N> {
 
         let listener = TcpListener::bind(self.node_ids[0])?;
 
+	let mut client_listener_id = self.node_ids[0].clone();
+	client_listener_id.1 = client_listener_id.1 + 10;
+        let client_listener = TcpListener::bind(client_listener_id)?;
+
         let me = Arc::new(Mutex::new(self));
 
         let me2 = me.clone();
@@ -133,6 +144,25 @@ impl<const N: usize> RaftNode<KvStateMachine, N> {
 		    let me = me.clone();
 		    thread::spawn(move || {
 			let mut server = raft_svc::server::RaftSvc {
+			    sender: connection.try_clone().unwrap(),
+			    receiver: connection,
+			    inner: me,
+			};
+
+			server.run()
+		    });
+                }
+            }
+        });
+
+        let me2 = me.clone();
+        thread::spawn(move || {
+            let me = me2;
+            for connection in client_listener.incoming() {
+                if let Ok(connection) = connection {
+		    let me = me.clone();
+		    thread::spawn(move || {
+			let mut server = raft_frontend::server::RaftFrontend {
 			    sender: connection.try_clone().unwrap(),
 			    receiver: connection,
 			    inner: me,
@@ -269,10 +299,11 @@ impl<const N: usize> RaftNode<KvStateMachine, N> {
 			info!("Elected as leader");
                         let mut state = me.lock().unwrap();
                         if let Role::Candidate = state.role {
-                            state.role = Role::Leader(LeaderState {
-				//next_idx: [0; N],
-				//match_idx: [0; N],
-			    });
+			    let leader_state = LeaderState {
+				next_idx: [state.log.len(); N],
+				match_idx: [0; N],
+			    };
+                            state.role = Role::Leader(leader_state);
                         } else {
                             debug!("I guess I'm following now?");
                         }
@@ -328,7 +359,7 @@ impl<const N: usize> RaftNode<KvStateMachine, N> {
                                         sender: stream.try_clone()?,
                                         receiver: stream,
                                     };
-                                    let (new_term, success) = client
+                                    let res = client
                                         .append_entries(
                                             term,
                                             leader_id,
@@ -337,7 +368,7 @@ impl<const N: usize> RaftNode<KvStateMachine, N> {
                                             vec![],
                                             leader_commit_idx,
                                         )?;
-                                    debug!("Send result {} {} {}", term, new_term, success);
+                                    debug!("Send result {term} {:?}", res);
 				    Ok(())
                                 })();
                                 if let Err(e) = res {
@@ -364,7 +395,7 @@ impl<T: RaftSvc> RaftSvc for Arc<Mutex<T>> {
         prev_log_term: Term,
         entries: Vec<(Term, KvCommand)>,
         leader_commit_idx: Option<LogIdx>,
-    ) -> (Term, bool) {
+    ) -> Result<(), AppendEntriesError> {
         self.lock().unwrap().append_entries(
             term,
             leader_id,
@@ -397,7 +428,7 @@ impl<const N: usize> RaftSvc for RaftNode<KvStateMachine, N> {
         prev_log_term: Term,
         mut entries: Vec<(Term, KvCommand)>,
         leader_commit_idx: Option<LogIdx>,
-    ) -> (Term, bool) {
+    ) -> Result<(), AppendEntriesError> {
         if term >= self.current_term {
             self.tickled = true;
             self.role = Role::Follower;
@@ -409,7 +440,7 @@ impl<const N: usize> RaftSvc for RaftNode<KvStateMachine, N> {
         }
 
         if term < self.current_term {
-            (self.current_term, false)
+            Err(AppendEntriesError::StaleTerm(self.current_term))
         } else if prev_log_idx
             .map(|pli| {
                 self.log
@@ -419,7 +450,7 @@ impl<const N: usize> RaftSvc for RaftNode<KvStateMachine, N> {
             })
             .unwrap_or(false)
         {
-            (self.current_term, false)
+            Err(AppendEntriesError::InconsistentLog)
         } else {
             self.log.truncate(prev_log_idx.map(|l| l + 1).unwrap_or(0));
             self.log.append(&mut entries);
@@ -434,7 +465,7 @@ impl<const N: usize> RaftSvc for RaftNode<KvStateMachine, N> {
                     }
                 }
             }
-            (self.current_term, true)
+            Ok(())
         }
     }
 
@@ -481,12 +512,19 @@ impl<const N: usize> RaftSvc for RaftNode<KvStateMachine, N> {
 
 #[cfg(test)]
 mod test {
+    use std::net::Ipv4Addr;
+
     use super::*;
 
+    const NODE_IDS: [(IpAddr, u16); 2] = [
+	(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 1111),
+	(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 1112),
+    ];
+
     #[test]
-    fn append_entries_incompatible_log() {
+    fn append_entries_empty() {
         let mut node = RaftNode {
-            node_ids: [([127, 0, 0, 1].into(), 1111), ([127,0,0,1].into(), 1112)],
+            node_ids: NODE_IDS,
             tickled: false,
             role: Role::Follower,
             commit_idx: None,
@@ -498,23 +536,133 @@ mod test {
             log: Default::default(),
         };
 
-	let (new_term, success) = node.append_entries(1, node.node_ids[1].clone(), None, 0, vec![], None);
-        assert_eq!(new_term, 1, "Term");
-        assert!(success, "Success");
+	let mut node_expected = node.clone();
 
-        let node_expected = RaftNode {
-            node_ids: [([127, 0, 0, 1].into(), 1111), ([127,0,0,1].into(), 1112)],
-            tickled: true,
-            role: Role::Follower,
-            commit_idx: None,
-            last_applied: None,
-            current_leader_id: Some(([127, 0, 0, 1].into(), 1112)),
-            state_machine: <KvStateMachine as Default>::default(),
-            current_term: 1,
-            voted_for: Some(([127, 0, 0, 1].into(), 1112)),
-            log: Default::default(),
-        };
+	let res = node.append_entries(1, NODE_IDS[1], None, 0, vec![], None);
+        assert_eq!(Ok(()), res);
+
+	node_expected.tickled = true;
+	node_expected.current_term = 1;
+	node_expected.current_leader_id = Some(NODE_IDS[1]);
 
 	assert_eq!(node, node_expected);
+    }
+}
+
+#[service]
+pub trait RaftFrontend {
+    fn do_op(&mut self, command: KvCommand) -> Option<u64>;
+}
+
+
+
+impl<const N: usize> RaftFrontend for Arc<Mutex<RaftNode<KvStateMachine, N>>> {
+    fn do_op(&mut self, command: KvCommand) -> Option<u64> {
+	let mystate = {
+	    let mut state = self.lock().unwrap();
+
+	    if let Role::Leader(leader_state) = state.role.clone() {
+		let current_term = state.current_term;
+		state.log.push((current_term, command.clone()));
+
+		let last_log_term = state.log.last().map(|e| e.0);
+		let last_log_idx = if state.log.len() > 0 { Some(state.log.len() - 1) } else { None };
+		Some((
+		    current_term,
+		    state.node_ids[0],
+		    last_log_idx,
+		    last_log_term,
+		    state.node_ids.clone(),
+		    state.commit_idx,
+		    leader_state,
+		))
+	    } else {
+		None
+	    }
+	};
+
+	if let Some((
+		current_term,
+		leader_id,
+		last_log_idx,
+		last_log_term,
+		node_ids,
+		leader_commit_idx,
+		mut leader_state,
+	    )) = mystate {
+
+	    let (send_succeeded, recv_succeeded) = channel();
+
+	    // Send to replicas
+	    for (i, node_id) in node_ids[1..].iter().enumerate() {
+		let command = command.clone();
+		let node_id = node_id.clone();
+		let send_succeeded = send_succeeded.clone();
+		thread::spawn(move || {
+		    let res: Result<(), Box<dyn Error>> = (|| {
+			let mut next_idx = leader_state.next_idx[i];
+			let mut match_idx = leader_state.match_idx[i];
+			while last_log_idx.map(|lli| lli >= next_idx).unwrap_or(false) {
+			    let prev_log_idx = if next_idx > 0 { Some(next_idx - 1) } else { None };
+
+			    let stream = TcpStream::connect(node_id)?;
+			    let mut client = raft_svc::client::RaftSvc {
+				sender: stream.try_clone()?,
+				receiver: stream,
+			    };
+			    let res = client
+				.append_entries(
+				    current_term,
+				    leader_id,
+				    prev_log_idx,
+				    last_log_term.unwrap_or(0),
+				    vec![(current_term, command.clone())],
+				    leader_commit_idx,
+				)?;
+			    debug!("Send result {current_term} {:?}", res);
+			    match res {
+				Err(AppendEntriesError::InconsistentLog) => {
+				    next_idx -= 1;
+				    continue;
+				},
+				Err(AppendEntriesError::StaleTerm(_term)) => {
+				    // TODO: Update term and become follower
+				    panic!("WTF");
+				},
+				Ok(_) => {
+				    next_idx += 1;
+				    match_idx += 1;
+				    break;
+				}
+			    }
+			}
+			leader_state.next_idx[i] = next_idx;
+			leader_state.match_idx[i] = match_idx;
+			let _ = send_succeeded.send(());
+			Ok(())
+		    })();
+		    if let Err(e) = res {
+			debug!("Errored {:?}", e);
+		    }
+		});
+	    }
+
+	    let mut succeeded_count = 0;
+	    for () in recv_succeeded.iter() {
+		succeeded_count += 1;
+		if succeeded_count > N / 2 {
+		    break;
+		}
+	    }
+	    // Execute
+	    let mut state = self.lock().unwrap();
+	    //state.role = Role::Leader(leader_state);
+	    let res = state.state_machine.apply(&command);
+
+	    res
+	} else {
+	    // TODO Not a leader!
+	    None
+	}
     }
 }

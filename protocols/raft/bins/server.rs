@@ -1,7 +1,7 @@
 use clap::{Args, Parser};
 use std::{net::IpAddr, error::Error};
 
-pub mod node;
+use crlf_raft;
 
 #[derive(Clone, Args)]
 struct NodeId {
@@ -25,7 +25,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     env_logger::init();
     let cli = Cli::parse();
 
-    node::RaftNode::<node::KvStateMachine, 3>::new(
+    crlf_raft::RaftNode::<crlf_raft::KvStateMachine, 3>::new(
         [
             (cli.myhost, cli.myip),
             (cli.node1_host, cli.node1_ip),

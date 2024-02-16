@@ -5,6 +5,16 @@ edition = "2021"
 license = "MIT"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[[bin]]
+name = "raft-client"
+path = "bins/client.rs"
+
+[[bin]]
+name = "raft-server"
+path = "bins/server.rs"
+
+[lib]
+
 
 [dependencies]
 clap = { version = "4.4.18", features = ["derive"] }
