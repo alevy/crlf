@@ -85,21 +85,21 @@ enum Role<const N: usize> {
 pub trait RaftSvc {
     fn append_entries(
         &mut self,
-        term: crate::node::Term,
-        leader_id: crate::node::NodeId,
-        prev_log_idx: Option<crate::node::LogIdx>,
-        prev_log_term: crate::node::Term,
-        entries: Vec<(crate::node::Term, crate::node::KvCommand)>,
-        leader_commit_idx: Option<crate::node::LogIdx>,
-    ) -> (crate::node::Term, bool);
+        term: Term,
+        leader_id: NodeId,
+        prev_log_idx: Option<LogIdx>,
+        prev_log_term: Term,
+        entries: Vec<(Term, KvCommand)>,
+        leader_commit_idx: Option<LogIdx>,
+    ) -> (Term, bool);
 
     fn request_vote(
         &mut self,
-        term: crate::node::Term,
-        candidate_id: crate::node::NodeId,
+        term: Term,
+        candidate_id: NodeId,
         log_len: usize,
-        last_log_term: Option<crate::node::Term>,
-    ) -> (crate::node::Term, bool);
+        last_log_term: Option<Term>,
+    ) -> (Term, bool);
 }
 
 impl<const N: usize> RaftNode<KvStateMachine, N> {

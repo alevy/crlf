@@ -139,7 +139,9 @@ pub fn service(
     let imp = quote::quote! {
 
     pub mod #service_mod {
+    use super::*;
     pub(self) mod rpc {
+	use super::*;
         use crlf::serde::{Serialize, Deserialize};
         #[allow(non_camel_case_types)]
         #[derive(Debug, Serialize, Deserialize)]
@@ -157,6 +159,7 @@ pub fn service(
     }
 
     pub mod client {
+	use super::*;
         pub struct #service_name<W, R> {
         pub sender: W,
         pub receiver: R,
@@ -168,6 +171,7 @@ pub fn service(
     }
 
     pub mod server {
+	use super::*;
         pub struct #service_name<W, R, S> {
         pub sender: W,
         pub receiver: R,
