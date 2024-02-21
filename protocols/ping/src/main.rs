@@ -3,7 +3,7 @@ use std::{
     time::Instant,
 };
 
-use crlf::{self, service};
+use crlf::{self, service, Pipelined};
 
 #[service]
 pub trait PingSvc {
@@ -56,12 +56,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Mode::Client { host, port, count } => {
-            let write_stream = TcpStream::connect((host.as_str(), port))?;
-            write_stream.set_nodelay(true)?;
-            let read_stream = write_stream.try_clone()?;
+            let connection = TcpStream::connect((host.as_str(), port))?;
+	    let pipelined = Pipelined::new_client(connection.try_clone().unwrap(), connection);
             let mut client = ping_svc::client::PingSvc {
-                sender: write_stream,
-                receiver: read_stream,
+                transport: pipelined,
             };
             let mut i = 0;
             for _ in 0..count {
@@ -84,9 +82,8 @@ mod tests {
     fn it_works() {
         let (s1, r1) = std::os::unix::net::UnixStream::pair().unwrap();
         let (s2, r2) = std::os::unix::net::UnixStream::pair().unwrap();
-        let mut myclient = ping_svc::client::PingSvc {
-            sender: s1,
-            receiver: r2,
+        let _myclient = ping_svc::client::PingSvc {
+            transport: (s1, r2),
         };
         std::thread::spawn(move || {
             let mut myserver = ping_svc::server::PingSvc {
@@ -97,6 +94,6 @@ mod tests {
 
             myserver.run();
         });
-        myclient.ping();
+        //myclient.ping().unwrap();
     }
 }

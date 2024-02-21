@@ -1,7 +1,7 @@
 use clap::{Args, Parser};
-use std::{net::IpAddr, net::TcpStream, error::Error};
+use std::{error::Error, net::IpAddr, net::TcpStream};
 
-use crlf_raft::{raft_frontend::client::RaftFrontend, KvCommand};
+use crlf_raft::{raft_frontend::client::RaftFrontend, KvOperation};
 
 #[derive(Clone, Args)]
 struct NodeId {
@@ -18,19 +18,22 @@ struct Cli {
 fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
 
-    let stream = TcpStream::connect((cli.node_host, cli.node_ip))?;
+    let transport = TcpStream::connect((cli.node_host, cli.node_ip))?;
 
-    let mut client = RaftFrontend {
-        sender: stream.try_clone().unwrap(),
-        receiver: stream,
-    };
+    let mut client = RaftFrontend { transport };
 
-    let result0 = client.do_op(KvCommand::Read { key: 123456 } )?;
+    let result0 = client.do_op(KvOperation::Read { key: 123456 })?;
     let incr_val = result0.map(|r| r + 1).unwrap_or(0);
     println!("{:?}", result0);
 
-    println!("{:?}", client.do_op(KvCommand::Write { key: 123456, value: incr_val } )?);
+    println!(
+        "{:?}",
+        client.do_op(KvOperation::Write {
+            key: 123456,
+            value: incr_val
+        })?
+    );
 
-    println!("{:?}", client.do_op(KvCommand::Read { key: 123456 } )?);
+    println!("{:?}", client.do_op(KvOperation::Read { key: 123456 })?);
     Ok(())
 }

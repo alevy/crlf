@@ -88,16 +88,15 @@ pub fn service(
             };
 
             Some(quote::quote! {
-            pub #sig {
-            #op
-            crlf::bincode::serialize_into(&mut self.sender, &op).expect("Oops");
-            let response = crlf::bincode::deserialize_from(&mut self.receiver)?;
-            match response {
-                super::rpc::Response::#name(output) => Ok(output),
-                r => panic!("Unexpected response: {:?}", r),
-            }
-            }
-            })
+                pub #sig {
+                #op
+            let response = self.transport.invoke(op).expect("Oops");
+                match response {
+                    super::rpc::Response::#name(output) => Ok(output),
+                    r => panic!("Unexpected response: {:?}", r),
+                }
+                }
+                })
         } else {
             None
         }
@@ -140,38 +139,37 @@ pub fn service(
 
     pub mod #service_mod {
     use super::*;
-    pub(self) mod rpc {
-	use super::*;
+    pub mod rpc {
+    use super::*;
         use crlf::serde::{Serialize, Deserialize};
         #[allow(non_camel_case_types)]
         #[derive(Debug, Serialize, Deserialize)]
         #[serde(crate = "crlf::serde")]
-        pub(super) enum Request {
+        pub enum Request {
         #(#ops)*
         }
 
         #[allow(non_camel_case_types)]
         #[derive(Debug, Serialize, Deserialize)]
         #[serde(crate = "crlf::serde")]
-        pub(super) enum Response {
+        pub enum Response {
         #(#resps)*
         }
     }
 
     pub mod client {
-	use super::*;
-        pub struct #service_name<W, R> {
-        pub sender: W,
-        pub receiver: R,
+    use super::*;
+        pub struct #service_name<T> {
+    pub transport: T,
         }
 
-        impl<W: ::std::io::Write, R: ::std::io::Read> #service_name<W, R> {
+        impl<T: ::crlf::ClientTransport<super::rpc::Request, super::rpc::Response>> #service_name<T> {
         #(#client_impls)*
         }
     }
 
     pub mod server {
-	use super::*;
+    use super::*;
         pub struct #service_name<W, R, S> {
         pub sender: W,
         pub receiver: R,

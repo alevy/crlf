@@ -1,5 +1,5 @@
 use clap::{Args, Parser};
-use std::{net::IpAddr, error::Error};
+use std::{error::Error, net::IpAddr};
 
 use crlf_raft;
 
