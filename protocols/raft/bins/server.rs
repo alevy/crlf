@@ -25,8 +25,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     env_logger::init();
     let cli = Cli::parse();
 
-    crlf_raft::RaftNode::<crlf_raft::KvStateMachine, 3>::new(
-        [
+    crlf_raft::RaftNode::<crlf_raft::KvStateMachine>::new(
+        vec![
             (cli.myhost, cli.myip),
             (cli.node1_host, cli.node1_ip),
             (cli.node2_host, cli.node2_ip),

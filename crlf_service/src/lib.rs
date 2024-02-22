@@ -61,10 +61,10 @@ pub fn service(
                 Default::default(),
                 Box::new(Type::Verbatim(match sig.output {
                     ReturnType::Type(_, typ) => {
-                        quote::quote! { crlf::bincode::Result< #typ > }
+                        quote::quote! { Result< #typ , Box<dyn std::error::Error> > }
                     }
                     ReturnType::Default => {
-                        quote::quote! { crlf::bincode::Result<()> }
+                        quote::quote! { Result<() , Box<dyn std::error::Error> > }
                     }
                 })),
             );
@@ -89,12 +89,12 @@ pub fn service(
 
             Some(quote::quote! {
                 pub #sig {
-                #op
-            let response = self.transport.invoke(op).expect("Oops");
-                match response {
-                    super::rpc::Response::#name(output) => Ok(output),
-                    r => panic!("Unexpected response: {:?}", r),
-                }
+                    #op
+		    let response = self.transport.invoke(op)?;
+		    match response {
+			super::rpc::Response::#name(output) => Ok(output),
+			r => panic!("Unexpected response: {:?}", r),
+		    }
                 }
                 })
         } else {

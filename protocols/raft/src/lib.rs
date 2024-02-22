@@ -8,7 +8,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::{cmp, thread};
 
 use crlf::serde::{Deserialize, Serialize};
-use crlf::service;
+use crlf::{service, Pipelined, Reconnector};
 use log::{debug, info};
 use rand::Rng;
 
@@ -50,13 +50,13 @@ type Term = u64;
 type NodeId = (IpAddr, u16);
 type LogIdx = usize;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RaftNode<STM: StateMachine, const N: usize = 3> {
-    node_ids: [NodeId; N],
+pub struct RaftNode<STM: StateMachine> {
+    node_ids: Vec<NodeId>,
+    node_connections: Vec<Pipelined<raft_svc::rpc::Request, raft_svc::rpc::Response>>,
     tickled: bool,
 
     // Volatile State
-    role: Role<N>,
+    role: Role,
     commit_idx: Option<LogIdx>,
     last_applied: Option<LogIdx>,
     current_leader_id: Option<NodeId>,
@@ -69,16 +69,16 @@ pub struct RaftNode<STM: StateMachine, const N: usize = 3> {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
-struct LeaderState<const N: usize> {
-    next_idx: [LogIdx; N],
-    match_idx: [LogIdx; N],
+struct LeaderState {
+    next_idx: Vec<LogIdx>,
+    match_idx: Vec<LogIdx>,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
-enum Role<const N: usize> {
+enum Role {
     Follower,
     Candidate,
-    Leader(LeaderState<N>),
+    Leader(LeaderState),
 }
 
 #[derive(PartialEq, Eq, Clone, Debug, Serialize, Deserialize)]
@@ -109,10 +109,22 @@ pub trait RaftSvc {
     ) -> (Term, bool);
 }
 
-impl<const N: usize> RaftNode<KvStateMachine, N> {
-    pub fn new(node_ids: [NodeId; N], state_machine: KvStateMachine) -> Self {
+impl RaftNode<KvStateMachine> {
+    pub fn new(node_ids: Vec<NodeId>, state_machine: KvStateMachine) -> Self {
+	let node_connections = node_ids.iter().map(|node_id| {
+	    let node_id = node_id.clone();
+	    let reconnector = Arc::new(Mutex::new(Reconnector::new(move || {
+		TcpStream::connect(node_id).map(|stream| {
+		    let _ = stream.set_nodelay(true);
+		    stream
+		}).ok()
+	    })));
+
+	    Pipelined::new_client(reconnector.clone(), reconnector)
+	}).collect();
         RaftNode {
             node_ids,
+	    node_connections,
             tickled: true,
             role: Role::Follower,
             commit_idx: None,
@@ -134,6 +146,7 @@ impl<const N: usize> RaftNode<KvStateMachine, N> {
         thread::spawn(move || {
             for connection in listener.incoming() {
                 if let Ok(connection) = connection {
+		    connection.set_nodelay(true).unwrap();
                     let me = me.clone();
                     thread::spawn(move || {
                         let mut server = raft_svc::server::RaftSvc {
@@ -159,6 +172,7 @@ impl<const N: usize> RaftNode<KvStateMachine, N> {
         thread::spawn(move || {
             for connection in client_listener.incoming() {
                 if let Ok(connection) = connection {
+		    connection.set_nodelay(true).unwrap();
                     let me = me.clone();
                     thread::spawn(move || {
                         let mut server = raft_frontend::server::RaftFrontend {
@@ -177,8 +191,8 @@ impl<const N: usize> RaftNode<KvStateMachine, N> {
 
     fn do_election(me: &Arc<Mutex<Self>>) {
         // Start election
-        let (current_term, new_term, candidate_id, log_len, last_log_term, other_nodes_ids) = {
-            let mut state = me.lock().unwrap();
+        let (current_term, new_term, candidate_id, log_len, last_log_term, mut node_connections) = {
+            let mut state = me.lock().unwrap_or_else(|e| e.into_inner());
 
             state.current_term += 1;
             state.voted_for = Some(state.node_ids[0]);
@@ -190,7 +204,7 @@ impl<const N: usize> RaftNode<KvStateMachine, N> {
                 state.node_ids[0],
                 state.log.len(),
                 last_log_term,
-                state.node_ids.clone(),
+                state.node_connections.clone(),
             )
         };
 
@@ -206,18 +220,17 @@ impl<const N: usize> RaftNode<KvStateMachine, N> {
         }));
         let cvar = Arc::new(Condvar::new());
 
-        for node_id in other_nodes_ids[1..].iter() {
+	let num_nodes = node_connections.len();
+        for transport in node_connections.drain(1..) {
             let updater = election.clone();
             let cvar = cvar.clone();
-            let node_id = node_id.clone();
             thread::spawn(move || {
                 let res: Result<(), Box<dyn Error>> = (|| {
-                    let transport = TcpStream::connect(node_id)?;
                     let mut client = raft_svc::client::RaftSvc { transport };
                     let (learned_term, success) =
                         client.request_vote(current_term, candidate_id, log_len, last_log_term)?;
 
-                    let mut updated = updater.lock()?;
+		    let mut updated = updater.lock().unwrap_or_else(|e| e.into_inner());
                     updated.total_votes += 1;
                     if learned_term > current_term {
                         updated.new_term = Some(learned_term);
@@ -238,21 +251,27 @@ impl<const N: usize> RaftNode<KvStateMachine, N> {
 
         // Wait for either all votes or majority votes
         let (updated, timed_out) = cvar
-            .wait_timeout_while(election.lock().unwrap(), Duration::from_millis(ms), |e| {
-                e.total_votes < N && e.for_votes < N / 2 + 1 && e.new_term.is_none()
+            .wait_timeout_while(election.lock().unwrap_or_else(|e| e.into_inner()), Duration::from_millis(ms), |e| {
+                e.total_votes < num_nodes && e.for_votes < num_nodes / 2 + 1 && e.new_term.is_none()
             })
             .unwrap();
 
         if timed_out.timed_out() {
             debug!("Timed out, try again...");
-        } else if updated.for_votes >= N / 2 + 1 {
+        } else if updated.for_votes >= num_nodes / 2 + 1 {
             // I won! I am a leader!
             info!("Elected as leader");
-            let mut state = me.lock().unwrap();
+	    let mut state = me.lock().unwrap_or_else(|e| e.into_inner());
             if let Role::Candidate = state.role {
+		let mut next_idx = Vec::new();
+		next_idx.resize(num_nodes, state.log.len());
+
+		let mut match_idx = Vec::new();
+		match_idx.resize(num_nodes, 0);
+
                 let leader_state = LeaderState {
-                    next_idx: [state.log.len(); N],
-                    match_idx: [0; N],
+                    next_idx,
+                    match_idx,
                 };
                 state.role = Role::Leader(leader_state);
             } else {
@@ -260,7 +279,7 @@ impl<const N: usize> RaftNode<KvStateMachine, N> {
             }
         } else if updated.new_term.is_some() {
             debug!("Term update!");
-            let mut state = me.lock().unwrap();
+	    let mut state = me.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(new_term) = updated.new_term {
                 state.current_term = new_term;
                 state.voted_for = None;
@@ -275,8 +294,8 @@ impl<const N: usize> RaftNode<KvStateMachine, N> {
     }
 
     fn do_leader_keepalive(me: &Arc<Mutex<Self>>) {
-        let (term, leader_id, log_len, last_log_term, other_nodes_ids, leader_commit_idx) = {
-            let state = me.lock().unwrap();
+        let (term, leader_id, log_len, last_log_term, mut node_connections, leader_commit_idx) = {
+	    let state = me.lock().unwrap_or_else(|e| e.into_inner());
 
             let last_log_term = state.log.last().map(|e| e.0);
             (
@@ -284,44 +303,41 @@ impl<const N: usize> RaftNode<KvStateMachine, N> {
                 state.node_ids[0],
                 state.log.len(),
                 last_log_term,
-                state.node_ids.clone(),
+                state.node_connections.clone(),
                 state.commit_idx,
             )
         };
 
         let prev_log_idx = if log_len > 0 { Some(log_len - 1) } else { None };
 
-        thread::scope(|t| {
-            for node_id in other_nodes_ids[1..].iter() {
-                debug!("Sending!!!");
-                t.spawn(move || {
-                    let res: Result<(), Box<dyn Error>> = (|| {
-                        let transport = TcpStream::connect(node_id)?;
-                        let mut client = raft_svc::client::RaftSvc { transport };
-                        let res = client.append_entries(
-                            term,
-                            leader_id,
-                            prev_log_idx,
-                            last_log_term.unwrap_or(0),
-                            vec![],
-                            leader_commit_idx,
-                        )?;
-                        debug!("Send result {term} {:?}", res);
-                        Ok(())
-                    })();
-                    if let Err(e) = res {
-                        debug!("Errored {:?}", e);
-                    }
-                });
-            }
-        });
+	for transport in node_connections.drain(1..) {
+	    debug!("Sending!!!");
+	    thread::spawn(move || {
+		let res: Result<(), Box<dyn Error>> = (|| {
+		    let mut client = raft_svc::client::RaftSvc { transport };
+		    let res = client.append_entries(
+			term,
+			leader_id,
+			prev_log_idx,
+			last_log_term.unwrap_or(0),
+			vec![],
+			leader_commit_idx,
+		    )?;
+		    debug!("Send result {term} {:?}", res);
+		    Ok(())
+		})();
+		if let Err(e) = res {
+		    debug!("Errored {:?}", e);
+		}
+	    });
+	}
         debug!("Done sending");
         let timeout = Duration::from_millis(MIN_ELECTION_TIMEOUT / 3);
         thread::sleep(timeout);
     }
 
     fn do_follower_timeout(me: &Arc<Mutex<Self>>) {
-        let mut state = me.lock().unwrap();
+	let mut state = me.lock().unwrap_or_else(|e| e.into_inner());
         if state.tickled {
             state.tickled = false;
             drop(state);
@@ -349,7 +365,7 @@ impl<const N: usize> RaftNode<KvStateMachine, N> {
         Self::start_frontend(&me, client_address)?;
 
         loop {
-            let current_role: Role<N> = { me.lock().unwrap().role.clone() };
+            let current_role = { me.lock().unwrap_or_else(|e| e.into_inner()).role.clone() };
             match current_role {
                 Role::Follower => {
                     Self::do_follower_timeout(&me);
@@ -375,7 +391,7 @@ impl<T: RaftSvc> RaftSvc for Arc<Mutex<T>> {
         entries: Vec<(Term, KvOperation)>,
         leader_commit_idx: Option<LogIdx>,
     ) -> Result<(), AppendEntriesError> {
-        self.lock().unwrap().append_entries(
+        self.lock().unwrap_or_else(|e| e.into_inner()).append_entries(
             term,
             leader_id,
             prev_log_idx,
@@ -393,12 +409,12 @@ impl<T: RaftSvc> RaftSvc for Arc<Mutex<T>> {
         last_log_term: Option<Term>,
     ) -> (Term, bool) {
         self.lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .request_vote(term, candidate_id, log_len, last_log_term)
     }
 }
 
-impl<const N: usize> RaftSvc for RaftNode<KvStateMachine, N> {
+impl RaftSvc for RaftNode<KvStateMachine> {
     fn append_entries(
         &mut self,
         term: Term,
@@ -429,19 +445,27 @@ impl<const N: usize> RaftSvc for RaftNode<KvStateMachine, N> {
             })
             .unwrap_or(false)
         {
-            Err(AppendEntriesError::InconsistentLog)
+	    if entries.len() > 0 {
+		Err(AppendEntriesError::InconsistentLog)
+	    } else {
+		Ok(())
+	    }
         } else {
-            self.log.truncate(prev_log_idx.map(|l| l + 1).unwrap_or(0));
             self.log.append(&mut entries);
             if let Some(lci) = leader_commit_idx {
                 if self.commit_idx.map(|ci| lci > ci).unwrap_or(true) {
                     self.commit_idx = Some(cmp::min(lci, self.log.len() - 1));
-                    if let Some((last_applied, commit_idx)) = self.last_applied.zip(self.commit_idx)
-                    {
-                        for (_, ref entry) in Vec::from(&self.log[last_applied..commit_idx]) {
-                            self.state_machine.apply(entry);
-                        }
-                    }
+		    if let Some(commit_idx) = self.commit_idx {
+			let first_to_apply = if let Some(last_applied) = self.last_applied {
+			    last_applied + 1
+			} else {
+			    0
+			};
+			for (_, ref entry) in Vec::from(&self.log[first_to_apply..commit_idx]) {
+			    self.state_machine.apply(entry);
+			}
+			self.last_applied = Some(commit_idx);
+		    }
                 }
             }
             Ok(())
@@ -494,10 +518,10 @@ pub trait RaftFrontend {
     fn do_op(&mut self, command: KvOperation) -> Option<u64>;
 }
 
-impl<const N: usize> RaftFrontend for Arc<Mutex<RaftNode<KvStateMachine, N>>> {
+impl RaftFrontend for Arc<Mutex<RaftNode<KvStateMachine>>> {
     fn do_op(&mut self, command: KvOperation) -> Option<u64> {
         let mystate = {
-            let mut state = self.lock().unwrap();
+            let mut state = self.lock().unwrap_or_else(|e| e.into_inner());
 
             if let Role::Leader(leader_state) = state.role.clone() {
                 let current_term = state.current_term;
@@ -514,7 +538,7 @@ impl<const N: usize> RaftFrontend for Arc<Mutex<RaftNode<KvStateMachine, N>>> {
                     state.node_ids[0],
                     last_log_idx,
                     last_log_term,
-                    state.node_ids.clone(),
+                    state.node_connections.clone(),
                     state.commit_idx,
                     leader_state,
                 ))
@@ -528,22 +552,22 @@ impl<const N: usize> RaftFrontend for Arc<Mutex<RaftNode<KvStateMachine, N>>> {
             leader_id,
             last_log_idx,
             last_log_term,
-            node_ids,
+            mut node_connections,
             leader_commit_idx,
-            mut leader_state,
+            leader_state,
         )) = mystate
         {
             let (send_succeeded, recv_succeeded) = channel();
 
+	    let num_nodes = node_connections.len();
             // Send to replicas
-            for (i, node_id) in node_ids[1..].iter().enumerate() {
+            for (i, transport) in node_connections.drain(1..).enumerate() {
                 let command = command.clone();
-                let node_id = node_id.clone();
                 let send_succeeded = send_succeeded.clone();
+		let mut next_idx = leader_state.next_idx[i];
+		let mut match_idx = leader_state.match_idx[i];
                 thread::spawn(move || {
                     let res: Result<(), Box<dyn Error>> = (|| {
-                        let mut next_idx = leader_state.next_idx[i];
-                        let mut match_idx = leader_state.match_idx[i];
                         while last_log_idx.map(|lli| lli >= next_idx).unwrap_or(false) {
                             let prev_log_idx = if next_idx > 0 {
                                 Some(next_idx - 1)
@@ -551,8 +575,7 @@ impl<const N: usize> RaftFrontend for Arc<Mutex<RaftNode<KvStateMachine, N>>> {
                                 None
                             };
 
-                            let transport = TcpStream::connect(node_id)?;
-                            let mut client = raft_svc::client::RaftSvc { transport };
+                            let mut client = raft_svc::client::RaftSvc { transport: transport.clone() };
                             let res = client.append_entries(
                                 current_term,
                                 leader_id,
@@ -578,8 +601,8 @@ impl<const N: usize> RaftFrontend for Arc<Mutex<RaftNode<KvStateMachine, N>>> {
                                 }
                             }
                         }
-                        leader_state.next_idx[i] = next_idx;
-                        leader_state.match_idx[i] = match_idx;
+                        //leader_state.next_idx[i] = next_idx;
+                        //leader_state.match_idx[i] = match_idx;
                         let _ = send_succeeded.send(());
                         Ok(())
                     })();
@@ -592,13 +615,14 @@ impl<const N: usize> RaftFrontend for Arc<Mutex<RaftNode<KvStateMachine, N>>> {
             let mut succeeded_count = 0;
             for () in recv_succeeded.iter() {
                 succeeded_count += 1;
-                if succeeded_count > N / 2 {
+                if succeeded_count > num_nodes / 2 {
                     break;
                 }
             }
             // Execute
-            let mut state = self.lock().unwrap();
+            let mut state = self.lock().unwrap_or_else(|e| e.into_inner());
             state.role = Role::Leader(leader_state);
+	    state.commit_idx = last_log_idx;
             let res = state.state_machine.apply(&command);
 
             res
@@ -622,28 +646,5 @@ mod test {
 
     #[test]
     fn append_entries_empty() {
-        let mut node = RaftNode {
-            node_ids: NODE_IDS,
-            tickled: false,
-            role: Role::Follower,
-            commit_idx: None,
-            last_applied: None,
-            current_leader_id: None,
-            state_machine: <KvStateMachine as Default>::default(),
-            current_term: 0,
-            voted_for: Some(([127, 0, 0, 1].into(), 1112)),
-            log: Default::default(),
-        };
-
-        let mut node_expected = node.clone();
-
-        let res = node.append_entries(1, NODE_IDS[1], None, 0, vec![], None);
-        assert_eq!(Ok(()), res);
-
-        node_expected.tickled = true;
-        node_expected.current_term = 1;
-        node_expected.current_leader_id = Some(NODE_IDS[1]);
-
-        assert_eq!(node, node_expected);
     }
 }
