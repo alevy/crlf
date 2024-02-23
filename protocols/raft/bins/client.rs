@@ -31,19 +31,19 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let start = Instant::now();
 
-    let n = 100000;
+    let n = 500000;
     for _ in 0..n {
 
 	let result0 = client.do_op(KvOperation::Read { key: 123456 })?;
-	/*let incr_val = result0.map(|r| r + 1).unwrap_or(0);
+	let incr_val = result0.map(|r| r + 1).unwrap_or(0);
 
 	client.do_op(KvOperation::Write {
 	    key: 123456,
 	    value: incr_val
-	})?;*/
+	})?;
     }
 
-    let end = start.elapsed().as_micros() / n;
+    let end = start.elapsed().as_micros() / 2 / n;
 
     println!("{end} {:?}", client.do_op(KvOperation::Read { key: 123456 })?);
     Ok(())

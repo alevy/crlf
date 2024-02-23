@@ -13,6 +13,10 @@ path = "bins/client.rs"
 name = "raft-server"
 path = "bins/server.rs"
 
+[[bin]]
+name = "raft-cluster"
+path = "bins/setup_cluster.rs"
+
 [lib]
 
 
